@@ -1,5 +1,4 @@
 import express, { Request, Response, NextFunction } from 'express';
-import { createServer as createViteServer } from 'vite';
 import crypto from 'crypto';
 import path from 'path';
 import dotenv from 'dotenv';
@@ -1324,6 +1323,7 @@ async function startServer() {
 
   // Vite middleware in development, static assets in production
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
