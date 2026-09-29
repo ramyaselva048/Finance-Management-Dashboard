@@ -1,0 +1,6 @@
+{
+  "name": "Azia Finance Monitoring Dashboard",
+  "description": "Complete Finance Monitoring and Management Dashboard for tracking profit margins, account balances, financial ratios, income, expenses, accounts receivable, and accounts payable.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
