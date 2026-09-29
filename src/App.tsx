@@ -30,8 +30,6 @@ import {
 } from './utils/printReport';
 import { Loader2 } from 'lucide-react';
 
-const STORAGE_KEY_RECORDS = 'azia_finance_records_v1';
-const STORAGE_KEY_ACCOUNT = 'azia_finance_account_v1';
 const STORAGE_KEY_TOKEN = 'azia_auth_token_v1';
 const STORAGE_KEY_USER = 'azia_auth_user_v1';
 const STORAGE_KEY_EXPIRES = 'azia_auth_expires_v1';
@@ -62,10 +60,35 @@ function clearStoredAuth() {
 
 export default function App() {
   // --- Authentication & Protected Session State ---
-  const [authChecking, setAuthChecking] = useState<boolean>(true);
-  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
-  const [authToken, setAuthToken] = useState<string | null>(null);
-  const [sessionExpiresAt, setSessionExpiresAt] = useState<number | null>(null);
+  const [authToken, setAuthToken] = useState<string | null>(() => getStoredToken());
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(() => {
+    try {
+      const raw =
+        localStorage.getItem(STORAGE_KEY_USER) ||
+        sessionStorage.getItem(STORAGE_KEY_USER);
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  });
+  const [authChecking, setAuthChecking] = useState<boolean>(() => {
+    const hasToken = Boolean(getStoredToken());
+    const hasCachedUser = Boolean(
+      localStorage.getItem(STORAGE_KEY_USER) ||
+        sessionStorage.getItem(STORAGE_KEY_USER)
+    );
+    return hasToken && !hasCachedUser;
+  });
+  const [sessionExpiresAt, setSessionExpiresAt] = useState<number | null>(() => {
+    try {
+      const exp =
+        localStorage.getItem(STORAGE_KEY_EXPIRES) ||
+        sessionStorage.getItem(STORAGE_KEY_EXPIRES);
+      return exp ? Number(exp) : null;
+    } catch {
+      return null;
+    }
+  });
   const [authMode, setAuthMode] = useState<AuthPageMode>(() => {
     const path = window.location.pathname.toLowerCase();
     if (path.includes('register')) return 'register';
@@ -220,48 +243,20 @@ export default function App() {
     return () => window.removeEventListener('popstate', handlePopState);
   }, [currentUser]);
 
-  // Persistent State for Financial Records
-  const [records, setRecords] = useState<FinancialRecord[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY_RECORDS);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-      }
-    } catch {
-      // ignore storage errors
-    }
-    return INITIAL_FINANCIAL_RECORDS;
-  });
+  // Financial Records & Account Info State (Permanently stored in Neon PostgreSQL neondb)
+  const [records, setRecords] = useState<FinancialRecord[]>(INITIAL_FINANCIAL_RECORDS);
+  const [accountInfo, setAccountInfo] = useState<AccountInfo>(INITIAL_ACCOUNT_INFO);
+  const [dbSyncStatus, setDbSyncStatus] = useState<'synced' | 'saving' | 'error'>('synced');
 
-  // Persistent State for Account Info
-  const [accountInfo, setAccountInfo] = useState<AccountInfo>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY_ACCOUNT);
-      if (saved) {
-        return JSON.parse(saved);
-      }
-    } catch {
-      // ignore storage errors
-    }
-    return INITIAL_ACCOUNT_INFO;
-  });
-
+  // Clear any legacy localStorage cache so Neon PostgreSQL is the sole source of truth
   useEffect(() => {
     try {
-      localStorage.setItem(STORAGE_KEY_RECORDS, JSON.stringify(records));
+      localStorage.removeItem('azia_finance_records_v1');
+      localStorage.removeItem('azia_finance_account_v1');
     } catch {
       // ignore
     }
-  }, [records]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY_ACCOUNT, JSON.stringify(accountInfo));
-    } catch {
-      // ignore
-    }
-  }, [accountInfo]);
+  }, []);
 
   // Load financial records and account info from Neon PostgreSQL whenever authenticated
   const fetchFinanceStateFromDb = useCallback(async (token: string) => {
@@ -271,15 +266,16 @@ export default function App() {
       });
       if (res.ok) {
         const data = await res.json();
-        if (Array.isArray(data.records) && data.records.length > 0) {
+        if (Array.isArray(data.records)) {
           setRecords(data.records);
         }
         if (data.accountInfo) {
           setAccountInfo(data.accountInfo);
         }
+        setDbSyncStatus('synced');
       }
     } catch {
-      // fallback to cached local state if offline
+      setDbSyncStatus('error');
     }
   }, []);
 
@@ -531,7 +527,7 @@ export default function App() {
     };
   }, [dateFilteredRecords, accountInfo.baseBalance]);
 
-  // CRUD Handlers (Backed by Neon PostgreSQL)
+  // CRUD Handlers (Permanently Saved in Neon PostgreSQL neondb)
   const handleAddRecord = async (newRec: Omit<FinancialRecord, 'id'>) => {
     const tempId = `rec-${Date.now()}`;
     const optimistic: FinancialRecord = {
@@ -541,6 +537,7 @@ export default function App() {
     setRecords((prev) => [optimistic, ...prev]);
 
     if (authToken) {
+      setDbSyncStatus('saving');
       try {
         const res = await fetch('/api/finance/records', {
           method: 'POST',
@@ -552,14 +549,17 @@ export default function App() {
         });
         if (res.ok) {
           const data = await res.json();
-          if (data.record) {
+          if (Array.isArray(data.records)) {
+            setRecords(data.records);
+          } else if (data.record) {
             setRecords((prev) =>
               prev.map((r) => (r.id === tempId ? data.record : r))
             );
           }
+          setDbSyncStatus('synced');
         }
       } catch {
-        // ignore network error
+        setDbSyncStatus('error');
       }
     }
   };
@@ -568,17 +568,28 @@ export default function App() {
     setRecords((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
 
     if (authToken) {
+      setDbSyncStatus('saving');
       try {
-        await fetch(`/api/finance/records/${encodeURIComponent(updated.id)}`, {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${authToken}`,
-          },
-          body: JSON.stringify(updated),
-        });
+        const res = await fetch(
+          `/api/finance/records/${encodeURIComponent(updated.id)}`,
+          {
+            method: 'PUT',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${authToken}`,
+            },
+            body: JSON.stringify(updated),
+          }
+        );
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data.records)) {
+            setRecords(data.records);
+          }
+          setDbSyncStatus('synced');
+        }
       } catch {
-        // ignore
+        setDbSyncStatus('error');
       }
     }
   };
@@ -587,13 +598,24 @@ export default function App() {
     setRecords((prev) => prev.filter((r) => r.id !== id));
 
     if (authToken) {
+      setDbSyncStatus('saving');
       try {
-        await fetch(`/api/finance/records/${encodeURIComponent(id)}`, {
-          method: 'DELETE',
-          headers: { Authorization: `Bearer ${authToken}` },
-        });
+        const res = await fetch(
+          `/api/finance/records/${encodeURIComponent(id)}`,
+          {
+            method: 'DELETE',
+            headers: { Authorization: `Bearer ${authToken}` },
+          }
+        );
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data.records)) {
+            setRecords(data.records);
+          }
+          setDbSyncStatus('synced');
+        }
       } catch {
-        // ignore
+        setDbSyncStatus('error');
       }
     }
   };
@@ -601,8 +623,9 @@ export default function App() {
   const handleUpdateAccountInfo = async (newInfo: AccountInfo) => {
     setAccountInfo(newInfo);
     if (authToken) {
+      setDbSyncStatus('saving');
       try {
-        await fetch('/api/finance/account', {
+        const res = await fetch('/api/finance/account', {
           method: 'PUT',
           headers: {
             'Content-Type': 'application/json',
@@ -610,8 +633,15 @@ export default function App() {
           },
           body: JSON.stringify(newInfo),
         });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.accountInfo) {
+            setAccountInfo(data.accountInfo);
+          }
+          setDbSyncStatus('synced');
+        }
       } catch {
-        // ignore
+        setDbSyncStatus('error');
       }
     }
   };
@@ -945,6 +975,7 @@ export default function App() {
         onPrintSingleRecord={handlePrintSingleRecord}
         onDownloadCSV={handleDownloadCSV}
         onResetData={handleResetData}
+        dbSyncStatus={dbSyncStatus}
         metrics={metrics}
       />
 

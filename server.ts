@@ -7,7 +7,7 @@ import pg from 'pg';
 
 dotenv.config();
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const JWT_SECRET =
   process.env.JWT_SECRET || 'azia-finance-production-jwt-secret-key-2026';
 
@@ -18,7 +18,6 @@ const DEFAULT_NEON_DB_URL =
 function normalizePgConnectionString(rawUrl: string): string {
   try {
     const url = new URL(rawUrl);
-    // Node pg handles ssl via the Pool config; remove channel_binding query param if present for compatibility
     url.searchParams.delete('channel_binding');
     return url.toString();
   } catch {
@@ -31,8 +30,14 @@ const pool = new pg.Pool({
     process.env.DATABASE_URL || DEFAULT_NEON_DB_URL
   ),
   ssl: { rejectUnauthorized: false },
-  max: 10,
-  idleTimeoutMillis: 30000,
+  max: 6,
+  idleTimeoutMillis: 20000,
+  connectionTimeoutMillis: 8000,
+  keepAlive: true,
+});
+
+pool.on('error', (err) => {
+  console.error('Unexpected Neon PostgreSQL pool error:', err.message);
 });
 
 export interface StoredUser {
@@ -56,7 +61,10 @@ export interface JwtPayload {
   exp: number;
 }
 
-// Initial Reference Financial Records for Seeding & Reset
+// Fast in-memory revoked JTI set (also persisted to Neon PostgreSQL azia_revoked_tokens)
+const revokedTokenJtis = new Set<string>();
+
+// Initial Reference Financial Records
 const INITIAL_SEED_RECORDS = [
   {
     id: 'inc-1',
@@ -299,9 +307,9 @@ function signJwt(
   };
 }
 
-async function verifyJwtWithDb(
+function verifyJwtFast(
   token: string
-): Promise<{ valid: boolean; payload?: JwtPayload; reason?: string }> {
+): { valid: boolean; payload?: JwtPayload; reason?: string } {
   try {
     const parts = token.split('.');
     if (parts.length !== 3) {
@@ -329,11 +337,7 @@ async function verifyJwtWithDb(
       return { valid: false, reason: 'Session has expired. Please sign in again.' };
     }
 
-    const revRes = await pool.query(
-      'SELECT jti FROM azia_revoked_tokens WHERE jti = $1',
-      [payload.jti]
-    );
-    if (revRes.rowCount && revRes.rowCount > 0) {
+    if (revokedTokenJtis.has(payload.jti)) {
       return { valid: false, reason: 'Session has been logged out or revoked.' };
     }
 
@@ -380,116 +384,6 @@ function validatePasswordStrength(password: string): string | null {
   return null;
 }
 
-// --- Initialize & Seed Neon PostgreSQL Tables ---
-async function initNeonDatabase(): Promise<void> {
-  const client = await pool.connect();
-  try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS azia_users (
-        id TEXT PRIMARY KEY,
-        full_name TEXT NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        role TEXT NOT NULL DEFAULT 'Finance Manager',
-        reset_code TEXT,
-        reset_code_expires_at BIGINT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS azia_revoked_tokens (
-        jti TEXT PRIMARY KEY,
-        revoked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS azia_account_info (
-        id INT PRIMARY KEY DEFAULT 1,
-        holder_name TEXT NOT NULL,
-        account_type TEXT NOT NULL,
-        card_number_prefix TEXT NOT NULL,
-        last_four TEXT NOT NULL,
-        base_balance NUMERIC(15, 2) NOT NULL,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS azia_financial_records (
-        id TEXT PRIMARY KEY,
-        type TEXT NOT NULL,
-        title TEXT NOT NULL,
-        category TEXT NOT NULL,
-        counterparty TEXT NOT NULL,
-        amount NUMERIC(15, 2) NOT NULL,
-        date TEXT NOT NULL,
-        status TEXT NOT NULL,
-        is_direct_cost BOOLEAN NOT NULL DEFAULT FALSE,
-        notes TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
-
-    // 1. Ensure default CFO user exists
-    const defaultUserCheck = await client.query(
-      'SELECT id FROM azia_users WHERE email = $1',
-      ['alicia@aziafinance.com']
-    );
-    if (defaultUserCheck.rowCount === 0) {
-      await client.query(
-        `INSERT INTO azia_users (id, full_name, email, password_hash, role, created_at)
-         VALUES ($1, $2, $3, $4, $5, NOW())`,
-        [
-          'usr-alicia-01',
-          'Alicia Christensen',
-          'alicia@aziafinance.com',
-          hashPassword('Finance@2026'),
-          'Chief Financial Officer',
-        ]
-      );
-    }
-
-    // 2. Ensure default Account Info exists
-    const accountCheck = await client.query(
-      'SELECT id FROM azia_account_info WHERE id = 1'
-    );
-    if (accountCheck.rowCount === 0) {
-      await client.query(
-        `INSERT INTO azia_account_info (id, holder_name, account_type, card_number_prefix, last_four, base_balance)
-         VALUES (1, $1, $2, $3, $4, $5)`,
-        ['Alicia Christensen', 'Savings', '4532 •••• ••••', '5637', 729609.5]
-      );
-    }
-
-    // 3. Seed Initial Financial Records if table is empty
-    const recordsCount = await client.query(
-      'SELECT COUNT(*)::int AS cnt FROM azia_financial_records'
-    );
-    if (recordsCount.rows[0].cnt === 0) {
-      for (const rec of INITIAL_SEED_RECORDS) {
-        await client.query(
-          `INSERT INTO azia_financial_records
-           (id, type, title, category, counterparty, amount, date, status, is_direct_cost, notes)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-           ON CONFLICT (id) DO NOTHING`,
-          [
-            rec.id,
-            rec.type,
-            rec.title,
-            rec.category,
-            rec.counterparty,
-            rec.amount,
-            rec.date,
-            rec.status,
-            rec.isDirectCost,
-            rec.notes,
-          ]
-        );
-      }
-    }
-
-    console.log('Neon PostgreSQL database initialized and verified.');
-  } finally {
-    client.release();
-  }
-}
-
 function mapDbUser(row: any): StoredUser {
   return {
     id: row.id,
@@ -523,50 +417,168 @@ function mapDbRecord(row: any) {
   };
 }
 
+// --- Initialize & Seed Neon PostgreSQL Tables ---
+async function initNeonDatabase(): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS azia_users (
+        id TEXT PRIMARY KEY,
+        full_name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'Finance Manager',
+        reset_code TEXT,
+        reset_code_expires_at BIGINT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS azia_revoked_tokens (
+        jti TEXT PRIMARY KEY,
+        revoked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS azia_account_info (
+        id INT PRIMARY KEY DEFAULT 1,
+        holder_name TEXT NOT NULL,
+        account_type TEXT NOT NULL,
+        card_number_prefix TEXT NOT NULL,
+        last_four TEXT NOT NULL,
+        base_balance NUMERIC(15, 2) NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS azia_app_meta (
+        meta_key TEXT PRIMARY KEY,
+        meta_value TEXT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS azia_financial_records (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        category TEXT NOT NULL,
+        counterparty TEXT NOT NULL,
+        amount NUMERIC(15, 2) NOT NULL,
+        date TEXT NOT NULL,
+        status TEXT NOT NULL,
+        is_direct_cost BOOLEAN NOT NULL DEFAULT FALSE,
+        notes TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    // Load revoked tokens into memory for 0ms JWT checks
+    const revRes = await client.query('SELECT jti FROM azia_revoked_tokens');
+    for (const r of revRes.rows) {
+      revokedTokenJtis.add(r.jti);
+    }
+
+    // 1. Ensure default CFO user exists
+    const defaultUserCheck = await client.query(
+      'SELECT id FROM azia_users WHERE email = $1',
+      ['alicia@aziafinance.com']
+    );
+    if (defaultUserCheck.rowCount === 0) {
+      await client.query(
+        `INSERT INTO azia_users (id, full_name, email, password_hash, role, created_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())`,
+        [
+          'usr-alicia-01',
+          'Alicia Christensen',
+          'alicia@aziafinance.com',
+          hashPassword('Finance@2026'),
+          'Chief Financial Officer',
+        ]
+      );
+    }
+
+    // 2. Ensure default Account Info exists
+    const accountCheck = await client.query(
+      'SELECT id FROM azia_account_info WHERE id = 1'
+    );
+    if (accountCheck.rowCount === 0) {
+      await client.query(
+        `INSERT INTO azia_account_info (id, holder_name, account_type, card_number_prefix, last_four, base_balance)
+         VALUES (1, $1, $2, $3, $4, $5)`,
+        ['Alicia Christensen', 'Savings', '4532 •••• ••••', '5637', 729609.5]
+      );
+    }
+
+    // 3. Seed Initial Financial Records ONLY once if never seeded before
+    const seedMetaCheck = await client.query(
+      "SELECT meta_value FROM azia_app_meta WHERE meta_key = 'initial_seed_v1'"
+    );
+    if (seedMetaCheck.rowCount === 0) {
+      const recordsCount = await client.query(
+        'SELECT COUNT(*)::int AS cnt FROM azia_financial_records'
+      );
+      if (recordsCount.rows[0].cnt === 0) {
+        for (const rec of INITIAL_SEED_RECORDS) {
+          await client.query(
+            `INSERT INTO azia_financial_records
+             (id, type, title, category, counterparty, amount, date, status, is_direct_cost, notes)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (id) DO NOTHING`,
+            [
+              rec.id,
+              rec.type,
+              rec.title,
+              rec.category,
+              rec.counterparty,
+              rec.amount,
+              rec.date,
+              rec.status,
+              rec.isDirectCost,
+              rec.notes,
+            ]
+          );
+        }
+      }
+      await client.query(
+        "INSERT INTO azia_app_meta (meta_key, meta_value) VALUES ('initial_seed_v1', 'completed') ON CONFLICT (meta_key) DO NOTHING"
+      );
+    }
+
+    console.log('Neon PostgreSQL database initialized and ready.');
+  } finally {
+    client.release();
+  }
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json());
 
-  await initNeonDatabase();
+  // Initialize Neon PostgreSQL in background so server binds port 3000 immediately
+  initNeonDatabase().catch((err) => {
+    console.error('Neon DB initialization error:', err.message);
+  });
 
-  // Auth Middleware backed by Neon PostgreSQL
-  const requireAuth = async (
-    req: Request & { user?: StoredUser; tokenPayload?: JwtPayload; rawToken?: string },
+  // Fast Auth Middleware
+  const requireAuth = (
+    req: Request & { tokenPayload?: JwtPayload; rawToken?: string },
     res: Response,
     next: NextFunction
   ) => {
-    try {
-      const token = extractToken(req);
-      if (!token) {
-        res.status(401).json({ error: 'Authentication required. Please log in.' });
-        return;
-      }
-
-      const verification = await verifyJwtWithDb(token);
-      if (!verification.valid || !verification.payload) {
-        res
-          .status(401)
-          .json({ error: verification.reason || 'Invalid or expired session.' });
-        return;
-      }
-
-      const userRes = await pool.query(
-        'SELECT * FROM azia_users WHERE id = $1',
-        [verification.payload.sub]
-      );
-      if (userRes.rowCount === 0) {
-        res.status(401).json({ error: 'User account no longer exists.' });
-        return;
-      }
-
-      req.user = mapDbUser(userRes.rows[0]);
-      req.tokenPayload = verification.payload;
-      req.rawToken = token;
-      next();
-    } catch (err) {
-      console.error('Auth middleware error:', err);
-      res.status(500).json({ error: 'Database authentication error.' });
+    const token = extractToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Authentication required. Please log in.' });
+      return;
     }
+
+    const verification = verifyJwtFast(token);
+    if (!verification.valid || !verification.payload) {
+      res
+        .status(401)
+        .json({ error: verification.reason || 'Invalid or expired session.' });
+      return;
+    }
+
+    req.tokenPayload = verification.payload;
+    req.rawToken = token;
+    next();
   };
 
   // ==================== DATABASE HEALTH ENDPOINT ====================
@@ -731,19 +743,18 @@ async function startServer() {
 
   // 3. LOGOUT
   app.post('/api/auth/logout', async (req: Request, res: Response) => {
-    try {
-      const token = extractToken(req);
-      if (token) {
-        const verification = await verifyJwtWithDb(token);
-        if (verification.payload?.jti) {
-          await pool.query(
+    const token = extractToken(req);
+    if (token) {
+      const verification = verifyJwtFast(token);
+      if (verification.payload?.jti) {
+        revokedTokenJtis.add(verification.payload.jti);
+        pool
+          .query(
             'INSERT INTO azia_revoked_tokens (jti) VALUES ($1) ON CONFLICT DO NOTHING',
             [verification.payload.jti]
-          );
-        }
+          )
+          .catch(() => {});
       }
-    } catch {
-      // ignore
     }
 
     res.setHeader(
@@ -757,18 +768,51 @@ async function startServer() {
   app.get(
     '/api/auth/me',
     requireAuth,
-    (req: Request & { user?: StoredUser; tokenPayload?: JwtPayload }, res: Response) => {
-      const user = req.user!;
-      res.json({
-        user: {
-          id: user.id,
-          fullName: user.fullName,
-          email: user.email,
-          role: user.role,
-          createdAt: user.createdAt,
-        },
-        expiresAt: req.tokenPayload!.exp * 1000,
-      });
+    async (req: Request & { tokenPayload?: JwtPayload }, res: Response) => {
+      try {
+        const payload = req.tokenPayload!;
+        const userRes = await pool.query(
+          'SELECT * FROM azia_users WHERE id = $1',
+          [payload.sub]
+        );
+        if (userRes.rowCount && userRes.rowCount > 0) {
+          const user = mapDbUser(userRes.rows[0]);
+          res.json({
+            user: {
+              id: user.id,
+              fullName: user.fullName,
+              email: user.email,
+              role: user.role,
+              createdAt: user.createdAt,
+            },
+            expiresAt: payload.exp * 1000,
+          });
+          return;
+        }
+        // Fallback to verified JWT claims if user row lookup is still warming up
+        res.json({
+          user: {
+            id: payload.sub,
+            fullName: payload.fullName,
+            email: payload.email,
+            role: payload.role,
+            createdAt: new Date(payload.iat * 1000).toISOString(),
+          },
+          expiresAt: payload.exp * 1000,
+        });
+      } catch {
+        const payload = req.tokenPayload!;
+        res.json({
+          user: {
+            id: payload.sub,
+            fullName: payload.fullName,
+            email: payload.email,
+            role: payload.role,
+            createdAt: new Date(payload.iat * 1000).toISOString(),
+          },
+          expiresAt: payload.exp * 1000,
+        });
+      }
     }
   );
 
@@ -776,11 +820,21 @@ async function startServer() {
   app.put(
     '/api/auth/profile',
     requireAuth,
-    async (req: Request & { user?: StoredUser }, res: Response) => {
+    async (req: Request & { tokenPayload?: JwtPayload }, res: Response) => {
       try {
         const { fullName, email, role, currentPassword, newPassword } =
           req.body || {};
-        const user = req.user!;
+        const userId = req.tokenPayload!.sub;
+
+        const userRes = await pool.query(
+          'SELECT * FROM azia_users WHERE id = $1',
+          [userId]
+        );
+        if (userRes.rowCount === 0) {
+          res.status(404).json({ error: 'User not found in database.' });
+          return;
+        }
+        const user = mapDbUser(userRes.rows[0]);
 
         let updatedName = user.fullName;
         let updatedEmail = user.email;
@@ -846,7 +900,7 @@ async function startServer() {
 
         const updatedUser = mapDbUser(updateRes.rows[0]);
         res.json({
-          message: 'Profile updated in Neon PostgreSQL.',
+          message: 'Profile updated permanently in Neon PostgreSQL.',
           user: {
             id: updatedUser.id,
             fullName: updatedUser.fullName,
@@ -981,10 +1035,13 @@ async function startServer() {
     requireAuth,
     async (req: Request & { tokenPayload?: JwtPayload }, res: Response) => {
       if (req.tokenPayload?.jti) {
-        await pool.query(
-          'INSERT INTO azia_revoked_tokens (jti) VALUES ($1) ON CONFLICT DO NOTHING',
-          [req.tokenPayload.jti]
-        );
+        revokedTokenJtis.add(req.tokenPayload.jti);
+        pool
+          .query(
+            'INSERT INTO azia_revoked_tokens (jti) VALUES ($1) ON CONFLICT DO NOTHING',
+            [req.tokenPayload.jti]
+          )
+          .catch(() => {});
       }
       res.setHeader(
         'Set-Cookie',
@@ -1035,7 +1092,7 @@ async function startServer() {
     }
   });
 
-  // CREATE a new financial record in Neon PostgreSQL
+  // CREATE a new financial record permanently in Neon PostgreSQL
   app.post('/api/finance/records', requireAuth, async (req: Request, res: Response) => {
     try {
       const {
@@ -1070,14 +1127,21 @@ async function startServer() {
         ]
       );
 
-      res.status(201).json({ record: mapDbRecord(insertRes.rows[0]) });
+      const allRes = await pool.query(
+        'SELECT * FROM azia_financial_records ORDER BY date DESC, created_at DESC'
+      );
+
+      res.status(201).json({
+        record: mapDbRecord(insertRes.rows[0]),
+        records: allRes.rows.map(mapDbRecord),
+      });
     } catch (err) {
       console.error('Error inserting record into Neon PostgreSQL:', err);
       res.status(500).json({ error: 'Failed to save financial record to database.' });
     }
   });
 
-  // UPDATE an existing financial record in Neon PostgreSQL
+  // UPDATE an existing financial record permanently in Neon PostgreSQL
   app.put(
     '/api/finance/records/:id',
     requireAuth,
@@ -1121,7 +1185,14 @@ async function startServer() {
           return;
         }
 
-        res.json({ record: mapDbRecord(updateRes.rows[0]) });
+        const allRes = await pool.query(
+          'SELECT * FROM azia_financial_records ORDER BY date DESC, created_at DESC'
+        );
+
+        res.json({
+          record: mapDbRecord(updateRes.rows[0]),
+          records: allRes.rows.map(mapDbRecord),
+        });
       } catch (err) {
         console.error('Error updating record in Neon PostgreSQL:', err);
         res.status(500).json({ error: 'Failed to update financial record.' });
@@ -1129,7 +1200,7 @@ async function startServer() {
     }
   );
 
-  // DELETE a financial record from Neon PostgreSQL
+  // DELETE a financial record permanently from Neon PostgreSQL
   app.delete(
     '/api/finance/records/:id',
     requireAuth,
@@ -1137,7 +1208,13 @@ async function startServer() {
       try {
         const { id } = req.params;
         await pool.query('DELETE FROM azia_financial_records WHERE id = $1', [id]);
-        res.json({ deletedId: id });
+        const allRes = await pool.query(
+          'SELECT * FROM azia_financial_records ORDER BY date DESC, created_at DESC'
+        );
+        res.json({
+          deletedId: id,
+          records: allRes.rows.map(mapDbRecord),
+        });
       } catch (err) {
         console.error('Error deleting record from Neon PostgreSQL:', err);
         res.status(500).json({ error: 'Failed to delete financial record.' });
@@ -1145,7 +1222,7 @@ async function startServer() {
     }
   );
 
-  // UPDATE Account Info in Neon PostgreSQL
+  // UPDATE Account Info permanently in Neon PostgreSQL
   app.put('/api/finance/account', requireAuth, async (req: Request, res: Response) => {
     try {
       const { holderName, accountType, cardNumberPrefix, lastFour, baseBalance } =
@@ -1185,7 +1262,7 @@ async function startServer() {
   app.post(
     '/api/finance/reset',
     requireAuth,
-    async (req: Request & { user?: StoredUser }, res: Response) => {
+    async (req: Request & { tokenPayload?: JwtPayload }, res: Response) => {
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
@@ -1211,7 +1288,7 @@ async function startServer() {
           );
         }
 
-        const holderName = req.user?.fullName || 'Alicia Christensen';
+        const holderName = req.tokenPayload?.fullName || 'Alicia Christensen';
         await client.query(
           `UPDATE azia_account_info
            SET holder_name = $1, account_type = 'Savings', card_number_prefix = '4532 •••• ••••', last_four = '5637', base_balance = 729609.50, updated_at = NOW()

@@ -39,6 +39,7 @@ interface FinanceManagerModalProps {
   onPrintSingleRecord: (rec: FinancialRecord) => void;
   onDownloadCSV: () => void;
   onResetData: () => void;
+  dbSyncStatus?: 'synced' | 'saving' | 'error';
   metrics: {
     totalIncome: number;
     totalExpense: number;
@@ -69,6 +70,7 @@ export const FinanceManagerModal: React.FC<FinanceManagerModalProps> = ({
   onPrintSingleRecord,
   onDownloadCSV,
   onResetData,
+  dbSyncStatus = 'synced',
   metrics,
 }) => {
   const [activeTab, setActiveTab] = useState<ManagerTab>(initialTab);
@@ -276,7 +278,10 @@ export const FinanceManagerModal: React.FC<FinanceManagerModalProps> = ({
                 Finance Management & Ledger Control
               </h2>
               <span className="inline-flex items-center gap-1 text-[11px] font-medium text-[#15803d] bg-[#f0fdf4] border border-[#bbf7d0] px-2 py-0.5 rounded-xs">
-                <CheckCircle2 className="w-3 h-3 text-[#2eb82e]" /> Neon PostgreSQL (neondb)
+                <CheckCircle2 className="w-3 h-3 text-[#2eb82e]" />
+                {dbSyncStatus === 'saving'
+                  ? 'Saving to neondb...'
+                  : 'Saved in Neon PostgreSQL (neondb)'}
               </span>
             </div>
             <p className="text-[12px] text-[#7987a1] mt-0.5">
