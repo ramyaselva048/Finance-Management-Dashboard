@@ -65,10 +65,10 @@ export const AuthPages: React.FC<AuthPagesProps> = ({
   const [loading, setLoading] = useState(false);
 
   // Login State
-  const [loginEmail, setLoginEmail] = useState('alicia@aziafinance.com');
-  const [loginPassword, setLoginPassword] = useState('Finance@2026');
+  const [loginEmail, setLoginEmail] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
   const [showLoginPassword, setShowLoginPassword] = useState(false);
-  const [rememberMe, setRememberMe] = useState(true);
+  const [rememberMe, setRememberMe] = useState(false);
 
   // Register State
   const [regFullName, setRegFullName] = useState('');
